@@ -1,0 +1,16 @@
+{
+  "name": "jh-migration-marketplace",
+  "version": "1.0.0",
+  "description": "StoresOnline to WordPress/WooCommerce migration tools",
+  "owner": {
+    "name": "jainakshay93",
+    "url": "https://github.com/jainakshay93"
+  },
+  "plugins": [
+    {
+      "name": "jh-migration",
+      "source": "./",
+      "description": "StoresOnline to WordPress/WooCommerce migration orchestrator"
+    }
+  ]
+}
