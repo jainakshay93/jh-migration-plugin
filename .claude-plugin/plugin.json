@@ -1,0 +1,8 @@
+{
+  "name": "jh-migration",
+  "description": "StoresOnline to WordPress/WooCommerce migration orchestrator. Automates the full migration process using the customer-xml-importer plugin: data analysis, customer/product/order import, image migration, and verification.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Akshay Jain"
+  }
+}
