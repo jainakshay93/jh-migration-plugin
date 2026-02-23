@@ -2,7 +2,7 @@
 name: jh-migrate
 description: StoresOnline to WordPress/WooCommerce migration orchestrator. Automates the full migration process using the customer-xml-importer plugin.
 user_invocable: true
-arguments: "[client-data-path]"
+arguments: "client_data_path"
 ---
 
 # StoresOnline to WordPress/WooCommerce Migration
@@ -80,6 +80,7 @@ Use the `AskUserQuestion` tool to ask THREE questions:
   - If need upload: local path to the data directory
 
 Store as: `SOURCE_SITE_URL`, `DATA_DIR`
+Derive: `SOURCE_SITE_DOMAIN` = strip protocol and trailing slash from `SOURCE_SITE_URL` (e.g., `https://www.marysgardenpatch.com/` → `www.marysgardenpatch.com`). Used for `--source-domain` flag on import-pages.
 
 ### Step 0.2a: If Local by Flywheel
 
@@ -451,6 +452,15 @@ ssh {SSH_CMD} "wp plugin install woocommerce --activate --path={WP_PATH} && wp t
 wp plugin install woocommerce --activate --path="{WP_PATH}" && wp theme install {THEME_SLUG_OR_ZIP} --activate --path="{WP_PATH}" && wp plugin deactivate customer-xml-importer --path="{WP_PATH}" && wp plugin activate customer-xml-importer --path="{WP_PATH}"
 ```
 
+**IMPORTANT**: WooCommerce 9.x defaults to "Coming Soon" mode for new installations, which blocks all storefront pages with a "Great things are on the horizon" landing page. Disable it immediately after WC install:
+```bash
+# Remote (add to the chained command above, or run separately):
+ssh {SSH_CMD} "wp option update woocommerce_coming_soon 'no' --path={WP_PATH} && wp option delete woocommerce_store_pages_only --path={WP_PATH} 2>/dev/null; true"
+
+# Local:
+wp option update woocommerce_coming_soon 'no' --path="{WP_PATH}" && wp option delete woocommerce_store_pages_only --path="{WP_PATH}" 2>/dev/null; true
+```
+
 If addon mode is enabled:
 ```bash
 wp plugin install "{ADDON_PLUGIN_PATH}" --activate --path="{WP_PATH}"
@@ -566,18 +576,19 @@ This uses ProductCategory.xml POSITION ordering to determine which products are 
 
 ```bash
 # Remote:
-ssh {SSH_CMD} "wp cxi import-pages '{DATA_DIR}/Page.xml' '{DATA_DIR}/PageElement.xml' --category-file='{DATA_DIR}/Category.xml' --product-file='{DATA_DIR}/Product.xml' --rewriteurl-file='{DATA_DIR}/RewriteURL.xml' --form-file='{DATA_DIR}/Form.xml' --formelement-file='{DATA_DIR}/FormElement.xml' --productcategory-file='{DATA_DIR}/ProductCategory.xml' --path={WP_PATH}"
+ssh {SSH_CMD} "wp cxi import-pages '{DATA_DIR}/Page.xml' '{DATA_DIR}/PageElement.xml' --category-file='{DATA_DIR}/Category.xml' --product-file='{DATA_DIR}/Product.xml' --rewriteurl-file='{DATA_DIR}/RewriteURL.xml' --form-file='{DATA_DIR}/Form.xml' --formelement-file='{DATA_DIR}/FormElement.xml' --productcategory-file='{DATA_DIR}/ProductCategory.xml' --source-domain='{SOURCE_SITE_DOMAIN}' --path={WP_PATH}"
 
 # Local:
-wp cxi import-pages "{DATA_DIR}/Page.xml" "{DATA_DIR}/PageElement.xml" --category-file="{DATA_DIR}/Category.xml" --product-file="{DATA_DIR}/Product.xml" --rewriteurl-file="{DATA_DIR}/RewriteURL.xml" --form-file="{DATA_DIR}/Form.xml" --formelement-file="{DATA_DIR}/FormElement.xml" --productcategory-file="{DATA_DIR}/ProductCategory.xml" --path="{WP_PATH}"
+wp cxi import-pages "{DATA_DIR}/Page.xml" "{DATA_DIR}/PageElement.xml" --category-file="{DATA_DIR}/Category.xml" --product-file="{DATA_DIR}/Product.xml" --rewriteurl-file="{DATA_DIR}/RewriteURL.xml" --form-file="{DATA_DIR}/Form.xml" --formelement-file="{DATA_DIR}/FormElement.xml" --productcategory-file="{DATA_DIR}/ProductCategory.xml" --source-domain="{SOURCE_SITE_DOMAIN}" --path="{WP_PATH}"
 ```
 
-**FLAGS**: `import-pages` supports `--batch-size`, `--category-file`, `--product-file`, `--rewriteurl-file`, `--form-file`, `--formelement-file`, `--productcategory-file`, `--notification-email`, `--include-hidden`, `--skip-sidebar`.
+**FLAGS**: `import-pages` supports `--batch-size`, `--category-file`, `--product-file`, `--rewriteurl-file`, `--form-file`, `--formelement-file`, `--productcategory-file`, `--source-domain`, `--notification-email`, `--include-hidden`, `--skip-sidebar`.
 
-**NEW FLAGS (v1.2)**:
+**NEW FLAGS (v1.2+)**:
 - `--form-file` — Path to Form.xml. Enables WPForms creation from StoresOnline form definitions.
 - `--formelement-file` — Path to FormElement.xml. Required with `--form-file` for form field mapping.
 - `--productcategory-file` — Path to ProductCategory.xml. Enables featured product marking from `showfeatured=true` elements.
+- `--source-domain` — The original StoresOnline site domain (e.g., `www.marysgardenpatch.com`). Enables rewriting of full source domain URLs in page content to local WordPress pages/categories. Extracted from `SOURCE_SITE_URL` (strip protocol, trailing slash). Store as `SOURCE_SITE_DOMAIN`.
 
 **AUTO-GENERATED**: The importer automatically detects the background template (shared layout) and generates:
 - **Sidebar widgets** in the theme's primary sidebar (auto-detected via `CXI_Theme_Compat`) from LOCATION=1 elements (nav menus, testimonials, forms, category lists, cart, search)
@@ -594,9 +605,38 @@ Use `--skip-sidebar` flag on re-runs to skip sidebar/footer regeneration.
 
 Report results: pages created, category pages detected, product blocks embedded, featured images set, sidebar widgets created, footer menu items, WPForms created, featured products marked, URL rewrites stored.
 
-### Step 3.6.5: Flush Rewrite Rules
+### Step 3.6.5: Clean Default Block Widgets & Flush Rewrite Rules
 
-After page import (which stores `cxi_category_url_map` for old category URLs), flush rewrite rules so the `cxi-site-customizations` plugin's URL rewrites take effect:
+**IMPORTANT**: Fresh WordPress installations add default block widgets (Search, Recent Posts, Recent Comments, Archives, Categories) to `sidebar-1` as `block-2` through `block-6`. The `import-pages` command APPENDS custom widgets but does NOT remove these defaults. Clean them now:
+
+```bash
+# Remote:
+ssh {SSH_CMD} "wp eval-file /dev/stdin --path={WP_PATH}" <<'CLEANPHP'
+<?php
+// Remove default block-* widgets from sidebar-1
+$sidebars = get_option('sidebars_widgets', array());
+if (isset($sidebars['sidebar-1'])) {
+    $original_count = count($sidebars['sidebar-1']);
+    $sidebars['sidebar-1'] = array_values(array_filter($sidebars['sidebar-1'], function($w) {
+        return strpos($w, 'block-') !== 0;
+    }));
+    $new_count = count($sidebars['sidebar-1']);
+    update_option('sidebars_widgets', $sidebars);
+    echo "Sidebar cleaned: removed " . ($original_count - $new_count) . " default block widgets, " . $new_count . " custom widgets remain\n";
+}
+// Also clean stale block widget data
+$widget_block = get_option('widget_block', array());
+foreach (array(2, 3, 4, 5, 6) as $id) {
+    unset($widget_block[$id]);
+}
+update_option('widget_block', $widget_block);
+CLEANPHP
+
+# Local (use PHP script upload pattern):
+# Write to /tmp/clean-sidebar.php, then: wp eval-file /tmp/clean-sidebar.php --path="{WP_PATH}"
+```
+
+After cleaning sidebar, flush rewrite rules so the `cxi-site-customizations` plugin's URL rewrites take effect:
 
 ```bash
 # Remote:
@@ -651,12 +691,14 @@ Report results: orders imported, skipped, errors.
 
 Run ALL cleanup in a SINGLE command:
 ```bash
-# Remote:
-ssh {SSH_CMD} "wp cache flush --path={WP_PATH} && wp rewrite flush --path={WP_PATH} && wp wc tool run recount_terms --user=1 --path={WP_PATH}"
+# Remote (includes Redis flush for SpinupWP/Redis hosting):
+ssh {SSH_CMD} "wp cache flush --path={WP_PATH} && wp rewrite flush --path={WP_PATH} && wp wc tool run recount_terms --user=1 --path={WP_PATH} && (redis-cli FLUSHALL 2>/dev/null || true) && (wp spinupwp cache purge-site --path={WP_PATH} 2>/dev/null || true)"
 
 # Local:
 wp cache flush --path="{WP_PATH}" && wp rewrite flush --path="{WP_PATH}" && wp wc tool run recount_terms --user=1 --path="{WP_PATH}"
 ```
+
+**IMPORTANT**: Remote servers with Redis object cache (e.g., SpinupWP) require `redis-cli FLUSHALL` to clear the external cache. Without this, WP-CLI DB changes (sidebar widgets, featured products, theme mods) may NOT appear on the frontend because Redis serves stale cached values to PHP-FPM.
 
 ---
 
@@ -676,17 +718,60 @@ wp cache flush --path="{WP_PATH}" && wp rewrite flush --path="{WP_PATH}" && wp w
 
 Use the **PHP Script Upload Pattern** (write PHP to `/tmp/`, scp, wp eval-file, rm) for all complex operations in this phase. This avoids SSH quoting issues with complex PHP arrays and strings.
 
-### Step 3.9.0: Source Site Crawl (Header Nav + Copyright)
+### Step 3.9.0: Source Site Crawl (Header Nav + Copyright + CSS Extraction)
 
-Use the Playwright MCP browser tools to crawl the source StoresOnline site (`SOURCE_SITE_URL`) homepage. This is a focused, lightweight crawl to detect only what import-pages doesn't handle:
+Use the Playwright MCP browser tools to crawl the source StoresOnline site (`SOURCE_SITE_URL`) homepage. This crawl detects what import-pages doesn't handle AND extracts the site-wide CSS styling.
 
 1. Navigate to `SOURCE_SITE_URL` at 1400x900 viewport
 2. Take an accessibility snapshot of the page
 3. **Detect header navigation links**: Look for the top navigation bar (typically `<div class="topLinks">` or similar). Extract link text and URL paths. Store as `SOURCE_HEADER_LINKS` array of `{title, slug, type, url}` objects.
 4. **Detect copyright text**: Look for copyright notice in the footer area (typically contains year and company name). Store as `SOURCE_COPYRIGHT_TEXT`.
 5. **Detect any extra pages** not in the XML data (e.g., "Site Map", "Gift Card Balance") that should be created as empty WordPress pages. Store as `PAGES_TO_CREATE`.
+6. **Extract comprehensive CSS styles** using JavaScript `getComputedStyle()`:
 
-If the source site is unreachable, ask the user to provide header menu links and copyright text manually.
+```javascript
+// Execute on the source site homepage to extract all key styles
+(() => {
+  const getStyle = (sel, props) => {
+    const el = document.querySelector(sel);
+    if (!el) return null;
+    const cs = getComputedStyle(el);
+    const result = {};
+    props.forEach(p => result[p] = cs.getPropertyValue(p));
+    return result;
+  };
+  const getAllLinks = (sel) => {
+    const els = document.querySelectorAll(sel);
+    if (!els.length) return null;
+    const cs = getComputedStyle(els[0]);
+    return { color: cs.color, fontFamily: cs.fontFamily, fontSize: cs.fontSize };
+  };
+  return JSON.stringify({
+    body: getStyle('body', ['background-color', 'color', 'font-family', 'font-size']),
+    h1: getStyle('h1,.heading5,font[size="5"]', ['color', 'font-family', 'font-size', 'font-weight']),
+    h2: getStyle('h2,.heading6,font[size="6"]', ['color', 'font-family', 'font-size', 'font-weight']),
+    h3: getStyle('h3,.heading3,font[size="3"]', ['color', 'font-family', 'font-size']),
+    headerLinks: getAllLinks('.topLinks a, .headerNav a, nav a'),
+    sidebarBg: getStyle('.sideBar, .sidebar, #sidebar, [class*="sidebar"]', ['background-color', 'border-color']),
+    sidebarLinks: getAllLinks('.sideBar a, .sidebar a'),
+    contentLinks: getAllLinks('.mainContent a, .content a, #content a'),
+    footerBg: getStyle('footer, .footer, #footer, .bottomNav', ['background-color', 'color']),
+    footerLinks: getAllLinks('footer a, .footer a, .bottomNav a'),
+    productLinks: getAllLinks('.productTitle a, .product a, a[href*="product"]'),
+    pageBg: getStyle('html', ['background-color']),
+    announcementText: getStyle('.announcement, .banner, .sale, [style*="color: green"], [color="green"]', ['color', 'font-size', 'font-weight']),
+  });
+})();
+```
+
+Store extracted styles as `SOURCE_CSS_STYLES` object. This captures the StoresOnline platform's default styling which is NOT available in the XML data.
+
+7. **Extract toll-free/shipping banners**: Look in the accessibility snapshot for text containing phone numbers (e.g., "1-800-XXX-XXXX", "toll-free"), shipping dates ("shipped", "shipping begins"), or announcement banners ("NOW ACCEPTING", "ON SALE").
+8. **Take full-page screenshot**: Save to `/tmp/source-site-reference.png` for later comparison in Phase 4.
+
+If the source site is unreachable, ask the user to provide header menu links, copyright text, and brand colors manually.
+
+**IMPORTANT**: The XML data only contains per-page style overrides (color_N, fontsize_N) on ~17% of pages. The site-wide styling comes from the StoresOnline platform CSS. This crawl is the ONLY reliable way to capture the global visual style.
 
 ### Step 3.9.1: Create WooCommerce Pages
 
@@ -712,16 +797,30 @@ Upload and execute via `wp eval-file`.
 
 ### Step 3.9.2: Set Homepage
 
+**IMPORTANT**: In StoresOnline, PAGE_ID=1 "Root" is a container with no real content. The actual homepage is typically PAGE_ID=2 "Home" (a child of Root). The importer creates a "Root" page but the homepage should be set to "Home" (slug: `home`), NOT "Root" (slug: `root`).
+
 ```php
 <?php
-$home_page = get_page_by_path('{HOMEPAGE_SLUG}');
+// Try 'home' first (the actual StoresOnline homepage), then HOMEPAGE_SLUG, then 'index'
+$home_page = get_page_by_path('home');
+if (!$home_page) {
+    $home_page = get_page_by_path('{HOMEPAGE_SLUG}');
+}
 if (!$home_page) {
     $home_page = get_page_by_path('index');
 }
 if ($home_page) {
     update_option('show_on_front', 'page');
     update_option('page_on_front', $home_page->ID);
+    // Hide page title on homepage
+    $meta = get_post_meta($home_page->ID, 'blocksy_post_meta_options', true);
+    if (!is_array($meta)) { $meta = array(); }
+    $meta['has_hero_section'] = 'disabled';
+    $meta['page_title_panel'] = 'no';
+    update_post_meta($home_page->ID, 'blocksy_post_meta_options', $meta);
     echo "Homepage set to: {$home_page->post_title} (ID: {$home_page->ID})\n";
+} else {
+    echo "WARNING: No homepage found. Check imported pages.\n";
 }
 ```
 
@@ -752,7 +851,18 @@ $header_placements = array(
         'id' => 'type-1', 'mode' => 'placements',
         'items' => array(
             array('id' => 'logo', 'values' => array('logo_max_height' => 80)),
-            array('id' => 'menu', 'values' => array()),
+            array('id' => 'menu', 'values' => array(
+                'header_menu_type' => 'type-1',
+                'headerMenuItemsGap' => '32',
+                'stretch_menu' => 'yes',
+                // CRITICAL: Set menu link color via theme_mod — Additional CSS !important does NOT work for Blocksy header
+                'headerMenuFontColor' => array(
+                    'default' => array('color' => '{SOURCE_HEADER_LINK_COLOR}'),
+                    'hover' => array('color' => '{SOURCE_HEADER_LINK_HOVER_COLOR}'),
+                    'active' => array('color' => '{SOURCE_H1_COLOR}'),
+                    'transparent' => array('color' => 'CT_CSS_SKIP_RULE'),
+                ),
+            )),
             array('id' => 'search', 'values' => array()),
             array('id' => 'cart', 'values' => array()),
             array('id' => 'trigger', 'values' => array()),
@@ -847,6 +957,96 @@ $astra_settings['site-sidebar-layout'] = $sidebar_map['left'];
 update_option('astra-settings', $astra_settings);
 ```
 
+### Step 3.9.3b: Generate Additional CSS from Source Site Styles
+
+**This step uses `SOURCE_CSS_STYLES` (from Step 3.9.0) and `cxi_homepage_styles` (extracted by import-pages) to generate WordPress Additional CSS that matches the source site's visual appearance.**
+
+The import-pages command stores homepage style params (color_5, fontsize_5, etc.) as `cxi_homepage_styles` WP option. Combine these with the source site's computed CSS to build a comprehensive Additional CSS stylesheet.
+
+```php
+<?php
+// Read extracted styles
+$homepage_styles = get_option('cxi_homepage_styles', array());
+
+// SOURCE_CSS_STYLES values are injected by the orchestrator from the crawl
+// These are the computed CSS values from the live source site
+$source_css = array(
+    'page_bg'        => '{SOURCE_CSS_STYLES.pageBg.background-color}',   // e.g., #f2f2f2
+    'body_font'      => '{SOURCE_CSS_STYLES.body.font-family}',          // e.g., Verdana
+    'body_size'      => '{SOURCE_CSS_STYLES.body.font-size}',            // e.g., 12px
+    'body_color'     => '{SOURCE_CSS_STYLES.body.color}',                // e.g., #000000
+    'h1_color'       => '{SOURCE_CSS_STYLES.h1.color}',                  // e.g., #cc3366
+    'h1_size'        => '{SOURCE_CSS_STYLES.h1.font-size}',              // e.g., 26px
+    'h1_font'        => '{SOURCE_CSS_STYLES.h1.font-family}',            // e.g., Arial
+    'h2_color'       => '{SOURCE_CSS_STYLES.h2.color}',                  // e.g., #cc3366
+    'h2_size'        => '{SOURCE_CSS_STYLES.h2.font-size}',              // e.g., 23px
+    'content_link'   => '{SOURCE_CSS_STYLES.contentLinks.color}',        // e.g., #64995d
+    'header_link'    => '{SOURCE_CSS_STYLES.headerLinks.color}',         // e.g., #64995d
+    'footer_bg'      => '{SOURCE_CSS_STYLES.footerBg.background-color}', // e.g., transparent
+    'footer_color'   => '{SOURCE_CSS_STYLES.footerBg.color}',            // e.g., #000000
+    'footer_link'    => '{SOURCE_CSS_STYLES.footerLinks.color}',         // e.g., #970000
+    'product_link'   => '{SOURCE_CSS_STYLES.productLinks.color}',        // e.g., #970000
+    'sidebar_bg'     => '{SOURCE_CSS_STYLES.sidebarBg.background-color}',
+    'sidebar_link'   => '{SOURCE_CSS_STYLES.sidebarLinks.color}',         // e.g., #64995d
+);
+
+// Override with homepage XML style params where available
+// StoresOnline numbering: 5=H1, 6=H2, 3=body text, 8=small text
+if (!empty($homepage_styles['color_5'])) {
+    $source_css['h1_color'] = '#' . $homepage_styles['color_5'];
+}
+if (!empty($homepage_styles['fontsize_5'])) {
+    $source_css['h1_size'] = $homepage_styles['fontsize_5'] . 'px';
+}
+if (!empty($homepage_styles['color_6'])) {
+    $source_css['h2_color'] = '#' . $homepage_styles['color_6'];
+}
+if (!empty($homepage_styles['fontsize_6'])) {
+    $source_css['h2_size'] = $homepage_styles['fontsize_6'] . 'px';
+}
+
+// Build Additional CSS
+$css = "/* Generated from source site CSS extraction */\n";
+$css .= "body { background-color: {$source_css['page_bg']}; font-family: {$source_css['body_font']}, sans-serif; font-size: {$source_css['body_size']}; color: {$source_css['body_color']}; }\n";
+$css .= ".entry-content h1, .page-title h1 { color: {$source_css['h1_color']}; font-size: {$source_css['h1_size']}; font-family: {$source_css['h1_font']}, sans-serif; }\n";
+$css .= ".entry-content h2 { color: {$source_css['h2_color']}; font-size: {$source_css['h2_size']}; }\n";
+$css .= ".entry-content a { color: {$source_css['content_link']}; }\n";
+$css .= ".entry-content a:hover { text-decoration: underline; }\n";
+$css .= ".site-header a, .header-menu a { color: {$source_css['header_link']}; }\n";
+$css .= "footer a, .site-footer a { color: {$source_css['footer_link']}; }\n";
+$css .= ".wc-block-grid__product-title a, .woocommerce-loop-product__title { color: {$source_css['product_link']}; }\n";
+
+// Sidebar styling
+if (!empty($source_css['sidebar_bg']) && $source_css['sidebar_bg'] !== 'transparent') {
+    $css .= ".ct-sidebar { background-color: {$source_css['sidebar_bg']}; padding: 15px; }\n";
+}
+
+// Sidebar link color (may differ from content links)
+$sidebar_link = !empty($source_css['sidebar_link']) ? $source_css['sidebar_link'] : $source_css['content_link'];
+$css .= ".ct-sidebar a, .ct-sidebar .widget a { color: {$sidebar_link}; }\n";
+
+// Footer background color
+if (!empty($source_css['footer_bg']) && $source_css['footer_bg'] !== 'transparent') {
+    $css .= "[data-footer] { background-color: {$source_css['footer_bg']}; }\n";
+}
+$css .= "[data-footer], [data-footer] .widget { color: {$source_css['footer_color']}; }\n";
+
+// Widget heading styles (Blocksy renders widget titles as h3)
+$css .= ".ct-sidebar .widget-title, .ct-sidebar h3 { color: {$source_css['h2_color']}; font-size: {$source_css['h2_size']}; }\n";
+
+// Body font-size with specificity (Blocksy may override base)
+$css .= ".site-content, .entry-content, .entry-content p { font-size: {$source_css['body_size']}; }\n";
+
+// Store as WordPress Additional CSS
+wp_update_custom_css_post($css);
+echo "Additional CSS generated (" . strlen($css) . " bytes):\n";
+echo $css;
+```
+
+Upload and execute via `wp eval-file`. The orchestrator should replace the `{SOURCE_CSS_STYLES.*}` placeholders with actual values extracted from the source site crawl in Step 3.9.0.
+
+**IMPORTANT**: RGB values from `getComputedStyle()` must be converted to hex before insertion. Use this conversion: `rgb(R, G, B)` → `#RRGGBB`.
+
 ### Step 3.9.4: Build Header Menu (from SOURCE_HEADER_LINKS)
 
 Using the `SOURCE_HEADER_LINKS` detected in Step 3.9.0 (source site crawl), write a PHP script that:
@@ -856,7 +1056,8 @@ Using the `SOURCE_HEADER_LINKS` detected in Step 3.9.0 (source site crawl), writ
    - If URL path matches an existing page slug → add as `post_type` menu item
    - If URL path matches a WooCommerce page (cart, checkout, my-account) → add as `post_type`
    - Otherwise → add as `custom` link with `home_url($path)`
-4. Assigns menu to `primary` location via `set_theme_mod('nav_menu_locations', ...)`
+4. Assigns menu to the correct theme header menu location via `set_theme_mod('nav_menu_locations', ...)`
+   - **CRITICAL**: Blocksy uses `menu_1` (NOT `primary`) for the header menu location. Astra uses `primary`. Check `get_registered_nav_menus()` if unsure.
 
 ```php
 <?php
@@ -902,7 +1103,11 @@ foreach ($header_items as $item) {
 }
 
 $locations = get_theme_mod('nav_menu_locations', array());
-$locations['primary'] = $primary_menu_id;
+// CRITICAL: Blocksy uses 'menu_1' for header, NOT 'primary'!
+// Astra uses 'primary'. Check active theme to determine correct key.
+$theme_template = wp_get_theme()->get_template();
+$header_location = ($theme_template === 'blocksy') ? 'menu_1' : 'primary';
+$locations[$header_location] = $primary_menu_id;
 set_theme_mod('nav_menu_locations', $locations);
 ```
 
@@ -914,17 +1119,21 @@ The `import-pages` command (Step 3.6) auto-creates the **Footer Menu** and **Sit
 <?php
 $locations = get_theme_mod('nav_menu_locations', array());
 
-// 1. Assign Primary Menu (built in Step 3.9.4) to 'primary' location
+// 1. Assign Primary Menu (built in Step 3.9.4) to header location
+// CRITICAL: Blocksy uses 'menu_1' for header, NOT 'primary'!
+// Astra uses 'primary'. Check active theme template to determine correct key.
+$theme_template = wp_get_theme()->get_template();
 $primary_menu = wp_get_nav_menu_object('Primary Menu');
 if ($primary_menu) {
-    $locations['primary'] = $primary_menu->term_id;
+    $header_location = ($theme_template === 'blocksy') ? 'menu_1' : 'primary';
+    $locations[$header_location] = $primary_menu->term_id;
 }
 
 // 2. Assign Footer Menu (auto-created by import-pages) to footer location
 $footer_menu = wp_get_nav_menu_object('Footer Menu');
 if ($footer_menu) {
     // Astra uses 'footer_menu', Blocksy uses 'footer'
-    $footer_location_key = (wp_get_theme()->get_template() === 'astra') ? 'footer_menu' : 'footer';
+    $footer_location_key = ($theme_template === 'astra') ? 'footer_menu' : 'footer';
     $locations[$footer_location_key] = $footer_menu->term_id;
 }
 
@@ -945,12 +1154,14 @@ Upload and execute via `wp eval-file`.
 ### Step 3.9.6: Final Cache Flush
 
 ```bash
-# Remote:
-ssh {SSH_CMD} "wp cache flush --path={WP_PATH} && wp rewrite flush --path={WP_PATH}"
+# Remote (includes Redis + SpinupWP page cache purge):
+ssh {SSH_CMD} "wp cache flush --path={WP_PATH} && wp rewrite flush --path={WP_PATH} && (redis-cli FLUSHALL 2>/dev/null || true) && (wp spinupwp cache purge-site --path={WP_PATH} 2>/dev/null || true)"
 
 # Local:
 wp cache flush --path="{WP_PATH}" && wp rewrite flush --path="{WP_PATH}"
 ```
+
+**CRITICAL**: This is the LAST cache flush before verification. On Redis-backed hosts, `redis-cli FLUSHALL` ensures all WP-CLI changes (sidebar widgets, featured products, menus, theme mods) are visible on the frontend. The `2>/dev/null || true` ensures non-Redis hosts don't fail.
 
 ### Step 3.9.7: Report Site Configuration Results
 
@@ -1020,6 +1231,8 @@ Use the Playwright MCP browser tools to perform a comprehensive 10-step visual v
 
 **If `SOURCE_SITE_URL` is available**, also take matching screenshots of the source site for side-by-side comparison.
 
+#### Part A: Functional Checks (Checks 1-15)
+
 #### Check 1: Homepage Comparison
 - Navigate to migrated homepage at 1400x900 viewport
 - Screenshot: `/tmp/verify-homepage-migrated.png`
@@ -1028,7 +1241,7 @@ Use the Playwright MCP browser tools to perform a comprehensive 10-step visual v
 
 #### Check 2: Sidebar Widget Check
 - On the homepage, check the accessibility snapshot for sidebar presence
-- Verify sidebar contains: navigation menu, testimonial widget, newsletter/form widget
+- Verify sidebar contains: testimonial widget (first widget), cart widget, navigation menus, newsletter/form widget
 - Count total sidebar widgets and compare to source site sidebar element count
 
 #### Check 3: Footer Check
@@ -1093,14 +1306,129 @@ Use the Playwright MCP browser tools to perform a comprehensive 10-step visual v
 - Verify `cxi-site-customizations` plugin is active: `wp plugin list --name=cxi-site-customizations --format=csv --path={WP_PATH}`
 - Verify `wpforms-lite` plugin is active (if forms were imported)
 
-#### Check 16: Compile Diff Report
-- For each check above, record PASS/FAIL with details
+#### Part B: Deep CSS Visual Verification on 7+ Pages (Check 16)
+
+**This is the most important verification step.** It compares the computed CSS styles between the source and migrated sites across at least 7 pages to ensure the Additional CSS (from Step 3.9.3b) is correctly applied.
+
+**Page selection**: Choose 7 pages that represent different page types:
+1. **Homepage** — The primary page, most visible
+2. **A product category page** (e.g., Daffodils, Tulips) — Has product grid + text
+3. **A text-heavy page** (e.g., Gardening FAQ, About Us) — Has headings, paragraphs, links
+4. **A product detail page** (e.g., individual product page) — Has WC product layout
+5. **A page with embedded forms** (e.g., Newsletter Signup, Contact Us) — Has WPForms
+6. **A page with border/background styling** — Has inline CSS blocks
+7. **The Shop page** (/shop/) — WooCommerce archive page
+
+**For EACH of the 7 pages**, perform this CSS extraction on BOTH the source site and migrated site:
+
+```javascript
+// Execute this JavaScript on each page to extract computed styles
+(() => {
+  const getStyle = (sel, props) => {
+    const el = document.querySelector(sel);
+    if (!el) return null;
+    const cs = getComputedStyle(el);
+    const result = {};
+    props.forEach(p => result[p] = cs.getPropertyValue(p));
+    return result;
+  };
+  const rgbToHex = (rgb) => {
+    if (!rgb || !rgb.startsWith('rgb')) return rgb;
+    const m = rgb.match(/\d+/g);
+    if (!m || m.length < 3) return rgb;
+    return '#' + m.slice(0,3).map(x => parseInt(x).toString(16).padStart(2,'0')).join('');
+  };
+  const styles = {
+    pageBg: rgbToHex(getComputedStyle(document.body)?.backgroundColor),
+    bodyFont: getComputedStyle(document.body)?.fontFamily?.split(',')[0]?.trim(),
+    bodySize: getComputedStyle(document.body)?.fontSize,
+    bodyColor: rgbToHex(getComputedStyle(document.body)?.color),
+  };
+  // Check all heading levels
+  ['h1','h2','h3'].forEach(tag => {
+    const el = document.querySelector('.entry-content ' + tag + ', .page-content ' + tag + ', ' + tag);
+    if (el) {
+      const cs = getComputedStyle(el);
+      styles[tag + 'Color'] = rgbToHex(cs.color);
+      styles[tag + 'Size'] = cs.fontSize;
+      styles[tag + 'Font'] = cs.fontFamily?.split(',')[0]?.trim();
+    }
+  });
+  // Links
+  const link = document.querySelector('.entry-content a, .page-content a, .content a');
+  if (link) styles.linkColor = rgbToHex(getComputedStyle(link).color);
+  // Sidebar
+  const sidebar = document.querySelector('.ct-sidebar, .sidebar, #sidebar, [class*="sidebar"]');
+  if (sidebar) styles.sidebarBg = rgbToHex(getComputedStyle(sidebar).backgroundColor);
+  // Footer
+  const footer = document.querySelector('footer, .site-footer, #footer');
+  if (footer) {
+    styles.footerBg = rgbToHex(getComputedStyle(footer).backgroundColor);
+    styles.footerColor = rgbToHex(getComputedStyle(footer).color);
+  }
+  const footerLink = document.querySelector('footer a, .site-footer a');
+  if (footerLink) styles.footerLinkColor = rgbToHex(getComputedStyle(footerLink).color);
+  // Product titles
+  const prodTitle = document.querySelector('.wc-block-grid__product-title a, .woocommerce-loop-product__title, .product_title');
+  if (prodTitle) styles.productTitleColor = rgbToHex(getComputedStyle(prodTitle).color);
+  return JSON.stringify(styles);
+})();
+```
+
+**Comparison process**:
+1. For each page, extract styles from source site and migrated site
+2. Compare each CSS property
+3. Flag differences as: MATCH (exact), CLOSE (within 2 shades / 2px), MISMATCH (significantly different)
+4. Properties to compare: background color, body font, body size, body color, H1 color/size/font, H2 color/size, link color, sidebar background, footer colors, product title color
+
+**Present results as a comparison table per page:**
+
+```
+=== DEEP CSS VERIFICATION: {PAGE_NAME} ===
+
+| Property          | Source Site    | Migrated Site  | Status  |
+|-------------------|---------------|----------------|---------|
+| Page Background   | #f2f2f2       | #f2f2f2        | MATCH   |
+| Body Font         | Verdana       | Verdana        | MATCH   |
+| Body Font Size    | 12px          | 12px           | MATCH   |
+| Body Color        | #000000       | #000000        | MATCH   |
+| H1 Color          | #cc3366       | #cc3366        | MATCH   |
+| H1 Size           | 26px          | 26px           | MATCH   |
+| H2 Color          | #cc3366       | #cc3366        | MATCH   |
+| Content Link Color| #64995d       | #64995d        | MATCH   |
+| Sidebar BG        | #f0f0e0       | #f0f0e0        | MATCH   |
+| Footer Link Color | #970000       | #970000        | MATCH   |
+| Product Title     | #970000       | #970000        | MATCH   |
+```
+
+**After checking all 7 pages, present a summary:**
+
+```
+=== CSS VERIFICATION SUMMARY ===
+
+| Page                  | Properties Checked | Match | Close | Mismatch |
+|-----------------------|-------------------|-------|-------|----------|
+| Homepage              | 11                | 9     | 1     | 1        |
+| Daffodils             | 11                | 10    | 1     | 0        |
+| Gardening FAQ         | 8                 | 7     | 1     | 0        |
+| Product Detail        | 9                 | 8     | 0     | 1        |
+| Newsletter Signup     | 8                 | 8     | 0     | 0        |
+| Alliums (borders)     | 10                | 9     | 0     | 1        |
+| Shop                  | 9                 | 9     | 0     | 0        |
+| **TOTAL**             | **66**            | **60**| **3** | **3**    |
+```
+
+**Auto-fix for MISMATCH items**: If any CSS properties don't match, update the WordPress Additional CSS by appending corrections. Use `wp eval` to call `wp_update_custom_css_post()` with the corrected styles. Then re-check the affected pages.
+
+#### Check 17: Compile Full Diff Report
+- For each check above (1-16), record PASS/FAIL with details
 - If any FAIL, attempt auto-fix using PHP eval-file scripts uploaded to the server:
   - Missing sidebar widgets → re-run `wp cxi import-pages` with sidebar generation
   - Wrong menu location → fix via `set_theme_mod('nav_menu_locations', ...)`
   - Page title showing on homepage → `CXI_Theme_Compat::hide_page_title($homepage_id)` via wp eval
   - Category URLs 404 → `wp rewrite flush`
   - `cxi-site-customizations` not active → `wp plugin activate cxi-site-customizations`
+  - CSS mismatch → update Additional CSS via `wp_update_custom_css_post()`
 - Re-verify after any auto-fix
 
 Report results as a structured table:
@@ -1111,7 +1439,7 @@ Report results as a structured table:
 | #  | Check                    | Expected              | Actual                | Status |
 |----|--------------------------|----------------------|----------------------|--------|
 | 1  | Homepage renders         | Content visible       | {result}             | PASS/FAIL |
-| 2  | Sidebar widgets          | {N} widgets          | {N} found            | PASS/FAIL |
+| 2  | Sidebar widgets          | {N} widgets, testimonial first | {result}  | PASS/FAIL |
 | 3  | Footer menu              | {N} links + copyright | {result}             | PASS/FAIL |
 | 4  | Product page: {name1}    | {N} products, grid   | {result}             | PASS/FAIL |
 | 4  | Product page: {name2}    | {N} products, grid   | {result}             | PASS/FAIL |
@@ -1127,7 +1455,8 @@ Report results as a structured table:
 | 13 | Border/bg styling        | Styles preserved     | {result}             | PASS/FAIL |
 | 14 | Site navigation menu     | Menu with hierarchy  | {result}             | PASS/FAIL |
 | 15 | Plugin status            | Both active          | {result}             | PASS/FAIL |
-| 16 | Auto-fixes applied       | N/A                  | {fixes_count} fixes  | INFO |
+| 16 | CSS match (7 pages)      | >90% properties match| {result}             | PASS/FAIL |
+| 17 | Auto-fixes applied       | N/A                  | {fixes_count} fixes  | INFO |
 ```
 
 **IMPORTANT**: Do NOT stop the migration for FAIL results. Report all issues, apply auto-fixes where possible, and continue to Phase 5. Document unresolved issues in the final report.
@@ -1246,6 +1575,7 @@ Each `wp cxi` subcommand supports DIFFERENT flags. Do NOT assume a flag works ac
 | `--form-file` | NO | NO | YES | NO |
 | `--formelement-file` | NO | NO | YES | NO |
 | `--productcategory-file` | NO | NO | YES | NO |
+| `--source-domain` | NO | NO | YES | NO |
 | `--notification-email` | NO | NO | YES | YES |
 | `--path` | YES (always!) | YES (always!) | YES (always!) | YES (always!) |
 
@@ -1268,6 +1598,16 @@ WooCommerce MUST be active BEFORE the CXI plugin is loaded. After installing Woo
 ```bash
 wp plugin install woocommerce --activate && wp plugin deactivate customer-xml-importer && wp plugin activate customer-xml-importer
 ```
+
+### WooCommerce Coming Soon Mode (WC 9.x+)
+WooCommerce 9.x defaults to "Coming Soon" mode for new installations, which blocks ALL storefront pages with a "Great things are on the horizon" landing page. Always disable immediately after WC install:
+```bash
+wp option update woocommerce_coming_soon 'no' --path={WP_PATH}
+wp option delete woocommerce_store_pages_only --path={WP_PATH}
+```
+
+### Default Block Widgets in Fresh WordPress Installs
+Fresh WordPress installs add 5 default block widgets (Search, Recent Posts, Recent Comments, Archives, Categories) to `sidebar-1` as `block-2` through `block-6`. The `import-pages` command APPENDS custom widgets but does NOT remove these defaults. After page import, remove all `block-*` entries from `sidebars_widgets['sidebar-1']` and clean stale data from `widget_block` option.
 
 ### SSH Keepalive for Remote Servers
 ALWAYS use these SSH flags to prevent broken pipe disconnects during long imports:
@@ -1323,6 +1663,13 @@ set_theme_mod('single_page_structure', 'type-2'); // LEFT sidebar
 2. Falls back to `blocksy_get_theme_mod($prefix . '_structure', $default_structure)`
 3. Maps: `type-2` → `left`, `type-1` → `right`, anything else → `none`
 4. For `single_page` prefix, default is `type-4` (no sidebar)
+
+**Menu locations** (`get_registered_nav_menus()`):
+- `menu_1` — Header Menu 1 (this is the PRIMARY header menu — NOT `primary`!)
+- `menu_2` — Header Menu 2
+- `footer` — Footer menu
+- `menu_mobile` — Mobile menu
+- **WARNING**: Do NOT use `primary` for the header menu location — Blocksy does NOT register `primary`!
 
 **Header placements** (`set_theme_mod('header_placements', ...)`):
 - Structure: `sections[0].desktop` = array of rows (top-row, middle-row, bottom-row, offcanvas)
